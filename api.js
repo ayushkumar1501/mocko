@@ -1,27 +1,24 @@
-// Now in your handleModalUploadAndClose(...), you just do:
-
-const dateFolder = format(new Date(), 'dd-MM-yyyy');
-const folderPath = `${dateFolder}/${currentChatSession.id}/`;
-
-// First: Save files locally
-await uploadToLocalFolder(folderPath, invoiceFile, poFile);
-
-// Optional delay
-await new Promise(resolve => setTimeout(resolve, 3 * 60 * 1000));
-
-// Then: Trigger invoice processing pipeline
-const result = await uploadInvoice(currentChatSession.id, invoiceFile, poFile, hasPo);
+// chtwindow.jsx
+import { uploadInvoice, sendChatQuery, addMessageToSession, uploadFiles } from '../api'; 
+import format from 'date-fns/format'; // For formatting dates in folder paths
 
 
-//  api.js
+await uploadFiles(folderPath, invoiceFile, poFile); // instead of  uploadToLocalFolder 
+
+
+
+// frontend/src/api.js (Add Fetch Invoice Details)
+
+const API_BASE_URL = 'http://127.0.0.1:8000'; // Make sure this matches your FastAPI backend URL
+
 /**
- * Uploads invoice and optional PO file to a specific folder on the backend (e.g., /uploads/DATE/SESSION_ID/)
+ * Uploads invoice and optional PO file to the backend storage (local or S3 based on backend configuration)
  * @param {string} folderPath - The folder path to save files (format: DD-MM-YYYY/sessionId).
  * @param {File} invoiceFile - The invoice file.
  * @param {File} [poFile=null] - The optional PO file.
- * @returns {Promise<Object>} Confirmation from backend.
+ * @returns {Promise<Object>} Response from backend including storage type and file locations.
  */
-export const uploadToLocalFolder = async (folderPath, invoiceFile, poFile = null) => {
+export const uploadFiles = async (folderPath, invoiceFile, poFile = null) => {
   try {
     const formData = new FormData();
     formData.append('invoice', invoiceFile);
@@ -35,12 +32,19 @@ export const uploadToLocalFolder = async (folderPath, invoiceFile, poFile = null
 
     if (!response.ok) {
       const errorData = await response.json();
-      throw new Error(errorData.detail || 'Failed to upload files to local folder.');
+      throw new Error(errorData.detail || 'Failed to upload files.');
     }
 
-    return await response.json();
+    const result = await response.json();
+    console.log(`Files uploaded to ${result.storage_type || 'local'} storage`);
+    return result;
   } catch (error) {
-    console.error('Error uploading to local folder:', error);
+    console.error('Error uploading files:', error);
     throw error;
   }
 };
+
+// Keep the old function name for backward compatibility
+export const uploadToLocalFolder = uploadFiles;
+
+
