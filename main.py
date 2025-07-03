@@ -1,169 +1,244 @@
-# backend/app/services/file_storage.py
-import os
-import boto3
-from pathlib import Path
-from typing import Optional, Tuple
-from botocore.exceptions import NoCredentialsError, ClientError
-from dotenv import load_dotenv
-import shutil
-import mimetypes
+# tasks.py
+@task
+async def extract_data_from_document_task(file_bytes: bytes, document_type: str, session_id: Optional[str] = None) -> Dict[str, Any]:
+    logger = get_run_logger()
+    logger.info(f"Task: Extracting data for {document_type}...")
+    extracted_data = await extract_data_with_llm(file_bytes, document_type, session_id=session_id)
+    return extracted_data
 
-# Import storage utilities
-from app.utils.storage_utils import log_storage_operation, validate_storage_environment
 
-# Load environment variables
-load_dotenv()
+#invoice_processing_flow.py
 
-class FileStorageService:
-    """
-    Service to handle file storage with support for both local filesystem and AWS S3.
-    Storage method is determined by the LOCAL environment variable.
-    """
-    def __init__(self):
-        self.is_local = os.getenv("LOCAL", "true").lower() == "true"
-        print("is_local  🚨 : ", self.is_local )
-        if not self.is_local:
-            # Initialize S3 client for cloud storage
-            self.s3_bucket = os.getenv("AWS_S3_BUCKET_NAME")
-            self.s3_client = boto3.client(
-                's3',
-                aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-                aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-                region_name=os.getenv("AWS_REGION", "us-east-1")
+# backend/app/flows/invoice_processing_flow.py
+from prefect import flow, get_run_logger
+from prefect.exceptions import MissingResult
+from typing import Dict, Any, Optional
+from bson import ObjectId # Import ObjectId for checking duplicate invoices
+
+# Import the tasks
+from app.flows.tasks import (
+    extract_data_from_document_task,
+    extract_validation_criteria_task,
+    validate_invoice_against_checklist_task,
+    validate_invoice_against_po_task,
+    generate_summary_task,
+    store_invoice_result_task,
+    check_duplicate_task
+)
+
+@flow(name="Invoice Processing and Validation Flow")
+async def invoice_processing_flow(
+    invoice_file_bytes: Optional[bytes] = None, # Make invoice_file_bytes optional
+    po_file_bytes: Optional[bytes] = None,
+    has_po: bool = False,
+    db_conn: Any = None,
+    session_id: Optional[str] = None
+) -> Dict[str, Any]:
+    logger = get_run_logger()
+    logger.info("Starting Invoice Processing Flow...")
+
+    invoice_data: Dict[str, Any] = {}
+    po_data: Dict[str, Any] = {}
+    invoice_validation_issues: Dict[str, Any] = {}
+    
+    po_comparison_results: Dict[str, Any] = {"overall_match": True, "message": "PO comparison skipped, no PO provided."}
+
+    final_summary_data: Dict[str, Any] = {
+        "summary_message": "Processing did not complete fully.",
+        "extracted_invoice_fields": {},
+        "invoice_validation_issues": {},
+        "po_comparison_results": {},
+        "overall_invoice_validation_status": "Unknown",
+        "overall_po_comparison_status": "Unknown",
+        "selected_checklist_option": "Unknown",
+        "vendor_check_result": {"is_listed_vendor": False, "message": "Vendor check not performed."}
+    }
+
+    overall_status = "failed"
+    message = "An unexpected error occurred."
+    invoice_result_id: Optional[str] = None
+
+    if db_conn is None:
+        logger.error("Database connection was not provided to the Prefect flow. Cannot proceed with DB operations.")
+        return {
+            "status": "failed",
+            "message": "Database connection error.",
+            "invoice_result_id": None,
+            "result_summary": {"final_summary_message": "Database connection was not established for processing."}
+        }
+
+    try:
+        # --- Conditional Invoice Data Extraction ---
+        if invoice_file_bytes:
+            logger.info("Invoice file bytes provided. Attempting invoice data extraction.")
+            invoice_data = await extract_data_from_document_task(
+                file_bytes=invoice_file_bytes,
+                document_type="invoice",
+                session_id=session_id
             )
-            self.s3_base_url = os.getenv("AWS_S3_BASE_URL", f"https://{self.s3_bucket}.s3.amazonaws.com")
-            
-            # Validate S3 configuration
-            is_valid, error_msg = validate_storage_environment()
-            if not is_valid:
-                raise ValueError(error_msg)
-    
-    def _get_content_type(self, file_path: str, default: str = "application/octet-stream") -> str:
-        """
-        Determine content type from file extension.
-        """
-        content_type, _ = mimetypes.guess_type(file_path)
-        return content_type or default
-
-    async def upload_file(
-        self, 
-        file_content: bytes, 
-        file_path: str,
-        content_type: Optional[str] = None
-    ) -> Tuple[bool, str, str]:
-        """
-        Upload a file to either local storage or S3.
-        
-        Args:
-            file_content: The file content as bytes
-            file_path: The path where the file should be stored (e.g., "dd-MM-yyyy/sessionId/filename.ext")
-            content_type: Optional MIME type for the file
-        Returns:
-            Tuple of (success: bool, storage_type: str, path_or_url: str)
-        """
-        try:
-            # Auto-detect content type if not provided
-            if not content_type:
-                content_type = self._get_content_type(file_path)
-            
-            if self.is_local:
-                return await self._upload_local(file_content, file_path)
-            else:
-                return await self._upload_s3(file_content, file_path, content_type)
-        except Exception as e:
-            storage_type = "local" if self.is_local else "s3"
-            log_storage_operation("upload", file_path, storage_type, False, str(e))
-            return False, "error", str(e)
-    
-    async def _upload_local(self, file_content: bytes, file_path: str) -> Tuple[bool, str, str]:
-        """Upload file to local filesystem."""
-        try:
-            # Create full path
-            full_path = Path("uploads") / file_path
-            full_path.parent.mkdir(parents=True, exist_ok=True)
-            
-            # Write file
-            with open(full_path, "wb") as f:
-                f.write(file_content)
-            
-            log_storage_operation("upload", file_path, "local", True, f"Size: {len(file_content)} bytes")
-            return True, "local", str(full_path)
-        except Exception as e:
-            log_storage_operation("upload", file_path, "local", False, str(e))
-            raise
-    
-    async def _upload_s3(
-        self, 
-        file_content: bytes, 
-        file_path: str,
-        content_type: Optional[str] = None
-    ) -> Tuple[bool, str, str]:
-        """Upload file to AWS S3."""
-        try:
-            # Prepare S3 key (remove leading slash if present)
-            s3_key = file_path.lstrip('/')
-            
-            # Prepare upload arguments
-            extra_args = {}
-            if content_type:
-                extra_args['ContentType'] = content_type
-            
-            # Upload to S3
-            self.s3_client.put_object(
-                Bucket=self.s3_bucket,
-                Key=s3_key,
-                Body=file_content,
-                **extra_args
-            )
-            
-            # Generate URL
-            file_url = f"{self.s3_base_url}/{s3_key}"
-            
-            log_storage_operation("upload", s3_key, "s3", True, f"Size: {len(file_content)} bytes, URL: {file_url}")
-            return True, "s3", file_url
-        except NoCredentialsError:
-            error_msg = "AWS credentials not available"
-            log_storage_operation("upload", file_path, "s3", False, error_msg)
-            raise Exception(error_msg)
-        except ClientError as e:
-            error_msg = f"AWS S3 error: {e}"
-            log_storage_operation("upload", file_path, "s3", False, error_msg)
-            raise Exception(error_msg)
-        except Exception as e:
-            log_storage_operation("upload", file_path, "s3", False, str(e))
-            raise
-    
-    def get_storage_type(self) -> str:
-        """Return the current storage type being used."""
-        return "local" if self.is_local else "s3"
-    
-    def validate_configuration(self) -> bool:
-        """Validate that the storage configuration is properly set up."""
-        if self.is_local:
-            # For local storage, ensure uploads directory exists
-            Path("uploads").mkdir(exist_ok=True)
-            return True
+            if not invoice_data:
+                message = "Invoice data extraction failed or returned empty."
+                overall_status = "failed"
+                logger.error(message)
+                final_summary_data["summary_message"] = message
+                # Return immediately if invoice data is essential and extraction failed
+                return {
+                    "status": overall_status,
+                    "message": message,
+                    "invoice_result_id": None,
+                    "result_summary": final_summary_data
+                }
         else:
-            # For S3, test connection
-            try:
-                self.s3_client.head_bucket(Bucket=self.s3_bucket)
-                log_storage_operation("validate", self.s3_bucket, "s3", True, "Bucket accessible")
-                return True
-            except Exception as e:
-                log_storage_operation("validate", self.s3_bucket, "s3", False, str(e))
-                return False
+            logger.info("No invoice file bytes provided. Skipping invoice data extraction.")
+            message = "No invoice file provided for processing."
+            overall_status = "skipped_invoice"
+            final_summary_data["summary_message"] = message
+            # If no invoice, we cannot proceed with invoice-centric validations.
+            # You might want to adjust the return logic here based on whether a PO-only flow is desired.
+            # For now, if no invoice, we return a 'skipped' status.
+            return {
+                "status": overall_status,
+                "message": message,
+                "invoice_result_id": None, # No invoice_result_id if no invoice was processed
+                "result_summary": final_summary_data
+            }
 
-# Create a singleton instance
-file_storage_service = FileStorageService() 
+
+        is_duplicate, existing_invoice_id = await check_duplicate_task(
+            db_connection=db_conn,
+            invoice_data=invoice_data
+        )
+
+        if is_duplicate:
+            existing_invoice_doc = await db_conn.invoice_results.find_one({"_id": ObjectId(existing_invoice_id)})
+            existing_summary = existing_invoice_doc.get("summary", {"summary_message": "Duplicate invoice found."}) if existing_invoice_doc else {"summary_message": "Duplicate invoice found, but original summary unavailable."}
+
+            message = f"Duplicate invoice detected. Already processed under ID: {existing_invoice_id}"
+            overall_status = "duplicate"
+            logger.info(message)
+            return {
+                "status": overall_status,
+                "message": message,
+                "invoice_result_id": existing_invoice_id,
+                "result_summary": existing_summary
+            }
+
+        validation_criteria = extract_validation_criteria_task(
+            invoice_data=invoice_data
+        )
+        selected_checklist_option = validation_criteria.get("selected_option", "unknown")
+
+        is_invoice_valid, invoice_validation_issues, vendor_check_result = await validate_invoice_against_checklist_task(
+            invoice_data=invoice_data,
+            validation_criteria=validation_criteria
+        )
+
+        # --- Conditional PO Data Extraction and Comparison ---
+        if has_po and po_file_bytes:
+            logger.info("PO file provided. Proceeding with PO extraction and comparison.")
+            po_data = await extract_data_from_document_task(
+                file_bytes=po_file_bytes,
+                document_type="po",
+                session_id=session_id
+            )
+
+            if not po_data:
+                message += " PO data extraction failed. Skipping PO comparison."
+                logger.warning("PO data extraction failed. Skipping PO comparison.")
+                po_comparison_results = {"overall_match": False, "message": "PO data extraction failed."}
+            else:
+                po_comparison_results = await validate_invoice_against_po_task(
+                    invoice_data=invoice_data,
+                    po_data=po_data
+                )
+        elif has_po and po_file_bytes is None:
+             logger.warning("PO was indicated but no valid PO file bytes were received. Skipping PO comparison.")
+             po_comparison_results = {"overall_match": False, "message": "PO was indicated but no valid file was received."}
+        else:
+            logger.info("No PO file provided or explicitly skipped. Skipping PO comparison.")
+            po_comparison_results = {"overall_match": True, "message": "PO comparison skipped, no PO provided."}
 
 
+        final_summary_data = generate_summary_task(
+            invoice_data=invoice_data,
+            validation_issues=invoice_validation_issues,
+            po_comparison_results=po_comparison_results,
+            selected_option=selected_checklist_option,
+            vendor_check_result=vendor_check_result,
+            po_provided=has_po
+        )
+
+        if overall_status == "duplicate":
+            pass
+        elif not invoice_validation_issues and (po_comparison_results.get("overall_match", True) or not has_po):
+            overall_status = "accepted"
+            message = "Invoice successfully validated and matched with PO (if provided)."
+        elif invoice_validation_issues:
+            overall_status = "rejected"
+            message = "Invoice failed validation."
+        elif has_po and not po_comparison_results.get("overall_match", False):
+            overall_status = "rejected"
+            message = "Invoice did not match PO."
+        else:
+            overall_status = "rejected"
+            message = "Invoice processing completed with issues."
+
+        result_for_storage = {
+            "status": overall_status,
+            "message": final_summary_data.get("summary_message", "Summary message unavailable."),
+            "extracted_invoice_data": invoice_data,
+            "invoice_validation_status": final_summary_data.get("overall_invoice_validation_status", "Unknown"),
+            "invoice_validation_issues": invoice_validation_issues,
+            "extracted_po_data": po_data, # Ensure PO data is stored even if it was problematic
+            "po_comparison_status": final_summary_data.get("overall_po_comparison_status", "N/A"),
+            "po_comparison_results": po_comparison_results,
+            "summary": final_summary_data,
+            "selected_checklist_option": selected_checklist_option
+        }
+
+        stored_result_info = await store_invoice_result_task(
+            invoice_result_data=result_for_storage,
+            db_connection=db_conn
+        )
+        invoice_result_id = stored_result_info["invoice_result_id"]
+
+        logger.info(f"Invoice Processing Flow completed with status: {overall_status}")
+        return {
+            "status": overall_status,
+            "message": final_summary_data.get("summary_message", message),
+            "invoice_result_id": invoice_result_id,
+            "result_summary": final_summary_data
+        }
+
+    except MissingResult as e:
+        logger.error(f"A Prefect task failed to return a result: {e}", exc_info=True)
+        message = f"Processing failed: A task did not return a result. {e}"
+        final_summary_data["summary_message"] = final_summary_data.get("summary_message", message)
+        return {
+            "status": "failed",
+            "message": message,
+            "invoice_result_id": None,
+            "result_summary": final_summary_data
+        }
+    except Exception as e:
+        logger.error(f"An unhandled error occurred during flow execution: {e}", exc_info=True)
+        message = f"An internal error occurred: {e}"
+        final_summary_data["summary_message"] = final_summary_data.get("summary_message", message)
+        return {
+            "status": "failed",
+            "message": message,
+            "invoice_result_id": None,
+            "result_summary": final_summary_data
+        }
 
 
 
 
 # invoice_extractor.py
 
-async def extract_data_with_llm(file_bytes: bytes, document_type: str) -> Dict[str, Any]:
+
+
+async def extract_data_with_llm(file_bytes: bytes, document_type: str, session_id: Optional[str] = None) -> Dict[str, Any]:
     """
     Extracts structured data from a document (invoice or PO) using LLM (Gemini API).
     Prompts are harmonized to extract a consistent set of fields for comparison against the checklist.
@@ -175,6 +250,7 @@ async def extract_data_with_llm(file_bytes: bytes, document_type: str) -> Dict[s
     Args:
         file_bytes (bytes): The bytes content of the document (image/PDF).
         document_type (str): "invoice" or "po" to tailor the prompt.
+        session_id (Optional[str]): An optional session ID for mock data path construction.
 
     Returns:
         Dict[str, Any]: A dictionary containing the extracted fields,
@@ -186,262 +262,25 @@ async def extract_data_with_llm(file_bytes: bytes, document_type: str) -> Dict[s
     
     if mock_data_dir:
         today_str = date.today().strftime("%d-%m-%Y")
+        # Build base path with date folder
         full_path = os.path.join(mock_data_dir, today_str)
-        mock_data_dir=full_path
+        # NEW: Append session ID folder when provided
+        if session_id:
+            full_path = os.path.join(full_path, str(session_id))
+
         mock_file_name = f"{document_type}.json"
-        mock_file_path = os.path.join(mock_data_dir, mock_file_name)
-        logger.info(f"MOCK_LLM_DATA_DIR is set. Attempting to load mock data from: {mock_file_path}")
-        try:
-            with open(mock_file_path, 'r', encoding='utf-8') as f:
-                mock_data = json.load(f)
-            logger.info(f"Successfully loaded mock data for {document_type} from {mock_file_path}.")
-            return mock_data
-        except FileNotFoundError:
-            error_msg = f"Mock data file not found for document type '{document_type}' at {mock_file_path}"
-            logger.error(error_msg)
-            # If mock file is missing, we could choose to fall back to LLM or return an error.
-            # For demonstration, we'll return an error to indicate missing mock data.
-            return {"error": error_msg, "extracted_data": {}}
-        except json.JSONDecodeError as e:
-            error_msg = f"Error decoding JSON from mock data file {mock_file_path}: {e}"
-            logger.error(error_msg)
-            return {"error": error_msg, "extracted_data": {}}
-        except Exception as e:
-            error_msg = f"An unexpected error occurred while loading mock data from {mock_file_path}: {e}"
-            logger.error(error_msg)
-            return {"error": error_msg, "extracted_data": {}}
-    # --- END MOCK DATA LOGIC ---
-
-    logger.info(f"Invoking LLM for data extraction from {document_type}...")
+        mock_file_path = os.path.join(full_path, mock_file_name)
+        logger.debug(f"Session ID used for mock path: {session_id if session_id else 'N/A (backwards compatible fallback)'}")
 
 
 
 
-
-
-#backend/app/utils/storage_utils.py
-"""
-Storage utility functions for configuration validation and logging.
-"""
-import os
-from typing import Dict, Any
-from dotenv import load_dotenv
-
-load_dotenv()
-
-def get_storage_config() -> Dict[str, Any]:
-    """
-    Get the current storage configuration.
-    
-    Returns:
-        Dict containing storage configuration details
-    """
-    is_local = os.getenv("LOCAL", "true").lower() == "true"
-    
-    config = {
-        "is_local": is_local,
-        "storage_type": "local" if is_local else "s3"
-    }
-    
-    if not is_local:
-        config.update({
-            "s3_bucket": os.getenv("AWS_S3_BUCKET_NAME"),
-            "s3_region": os.getenv("AWS_REGION", "us-east-1"),
-            "s3_base_url": os.getenv("AWS_S3_BASE_URL"),
-            "has_credentials": bool(os.getenv("AWS_ACCESS_KEY_ID") and os.getenv("AWS_SECRET_ACCESS_KEY"))
-        })
-    
-    return config
-
-def validate_storage_environment() -> tuple[bool, str]:
-    """
-    Validate that all required environment variables are set for the current storage mode.
-    
-    Returns:
-        Tuple of (is_valid, error_message)
-    """
-    config = get_storage_config()
-    
-    if config["is_local"]:
-        # Local storage doesn't require additional configuration
-        return True, "Local storage configuration is valid"
-    
-    # Check S3 configuration
-    required_vars = [
-        "AWS_S3_BUCKET_NAME",
-        "AWS_ACCESS_KEY_ID", 
-        "AWS_SECRET_ACCESS_KEY"
-    ]
-    
-    missing_vars = []
-    for var in required_vars:
-        if not os.getenv(var):
-            missing_vars.append(var)
-    
-    if missing_vars:
-        return False, f"Missing required S3 environment variables: {', '.join(missing_vars)}"
-    
-    return True, "S3 storage configuration is valid"
-
-def log_storage_operation(operation: str, file_path: str, storage_type: str, success: bool, details: str = ""):
-    """
-    Log storage operations for debugging and monitoring.
-    
-    Args:
-        operation: The operation performed (upload, download, delete)
-        file_path: The file path involved
-        storage_type: local or s3
-        success: Whether the operation was successful
-        details: Additional details about the operation
-    """
-    status = "SUCCESS" if success else "FAILED"
-    message = f"[STORAGE] {operation.upper()} {status} | Type: {storage_type} | Path: {file_path}"
-    
-    if details:
-        message += f" | Details: {details}"
-    
-    print(message) 
-
-
-
-
-
-
-# backend/app/main.py
-import os
-from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File, HTTPException, Body, Depends, Form
-from fastapi.middleware.cors import CORSMiddleware
-from typing import Optional, Dict, Any, List, Union
-from pydantic import BaseModel, Field
-from datetime import datetime, timezone
-import json
-from bson import ObjectId
-import shutil
-from pathlib import Path
-
-# Import your database connection and models
-from app.database.connection import connect_to_mongo, close_mongo_connection, get_db
-from app.database.models import InvoiceProcessingResult, ChatSession, ChatMessage, InvoiceData, PoData, PyObjectId
-
-# Import your Prefect flow and chat task
-from app.flows.invoice_processing_flow import invoice_processing_flow
-from app.flows.tasks import handle_follow_up_query_task
-
-# Import file storage service
-from app.services.file_storage import file_storage_service
-
-# Import storage utilities
-from app.utils.storage_utils import get_storage_config, validate_storage_environment
-
-# Load environment variables
-load_dotenv()
-
-app = FastAPI(
-    title="Invoice Validation System",
-    description="API for uploading invoices, validating them against a checklist, comparing with POs, and handling follow-up queries using LLMs and Prefect.",
-    version="1.0.0"
-)
-
-# Configure CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["*"],
-)
-
-# --- FastAPI Startup/Shutdown Events for MongoDB Connection ---
-@app.on_event("startup")
-async def startup_db_client():
-    """Connect to MongoDB on FastAPI application startup."""
-    await connect_to_mongo()
-    # Validate storage configuration on startup
-    storage_type = file_storage_service.get_storage_type()
-    print(f"Storage mode: {storage_type.upper()}")
-    if not file_storage_service.validate_configuration():
-        print(f"WARNING: {storage_type} storage configuration validation failed!")
-
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    """Close MongoDB connection on FastAPI application shutdown."""
-    await close_mongo_connection()
-
-# --- Request Body Models for API Endpoints ---
-class ChatRequest(BaseModel):
-    message: str
-    invoice_result_id: Optional[str] = None
-    session_id: str
-
-class NewChatSessionRequest(BaseModel):
-    title: Optional[str] = "New Chat"
-
-class MessageAddRequest(BaseModel):
-    role: str
-    message: str
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
-    type: Optional[str] = None
-    payload: Optional[Dict[str, Any]] = None
-
-# --- API Endpoints ---
-@app.post("/upload-local/")
-async def upload_local(
-    folderPath: str = Form(...),
-    invoice: UploadFile = File(...),
-    po: UploadFile = File(None)
-):
-    """
-    Upload files to either local storage or S3 based on the LOCAL environment variable.
-    Despite the endpoint name, it now supports both storage methods.
-    """
-    try:
-        # Read invoice file content
-        invoice_content = await invoice.read()
-        invoice_path = f"{folderPath}/{invoice.filename}"
-        
-        # Upload invoice using the storage service
-        success, storage_type, invoice_location = await file_storage_service.upload_file(
-            invoice_content, 
-            invoice_path,
-            content_type=invoice.content_type
+# main.py
+ flow_run_result_dict = await invoice_processing_flow(
+            invoice_file_bytes=invoice_bytes,
+            po_file_bytes=po_bytes, # Will be None if no PO or empty PO
+            has_po=has_po, # Pass the has_po flag to the flow
+            db_conn=db_conn, # Pass the database connection to the Prefect flow
+            session_id=session_id
         )
         
-        if not success:
-            raise HTTPException(status_code=500, detail=f"Failed to upload invoice: {invoice_location}")
-        
-        po_location = None
-        if po:
-            # Read PO file content
-            po_content = await po.read()
-            po_path = f"{folderPath}/{po.filename}"
-            
-            # Upload PO using the storage service
-            po_success, _, po_location = await file_storage_service.upload_file(
-                po_content,
-                po_path,
-                content_type=po.content_type
-            )
-            
-            if not po_success:
-                raise HTTPException(status_code=500, detail=f"Failed to upload PO: {po_location}")
-        print(f"Files ❗🚨❗🚨❗🚨❗🚨 uploaded successfully: Invoice at {invoice_location}, PO at {po_location if po else 'N/A'}")
-        # Reset file pointers for any potential reuse
-        await invoice.seek(0)
-        if po:
-            await po.seek(0)
-        
-        return {
-            "message": f"Files uploaded successfully to {storage_type} storage",
-            "storage_type": storage_type,
-            "path": folderPath,
-            "invoice_location": invoice_location,
-            "po_location": po_location
-        }
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Error in upload endpoint: {e}")
-        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
-
